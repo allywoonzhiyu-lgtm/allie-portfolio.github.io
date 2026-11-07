@@ -143,7 +143,7 @@
   </div>
 
   <footer>
-    Saved automatically in this browser.
+    <span id="syncNote">Saved automatically.</span>
     <button id="exportBtn">Back up</button>·<button id="importBtn">Restore</button>·<button id="themeBtn">Theme</button>
     <input type="file" id="importFile" accept="application/json" hidden>
   </footer>
@@ -159,8 +159,38 @@ const MEALS = [
 ];
 
 function load() { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch { return {}; } }
-function save() { try { localStorage.setItem(KEY, JSON.stringify(data)); } catch {} }
 let data = load();   // { "2026-11-07": { b: {text, ate}, l: {...}, d: {...} } }
+
+// Cloud sync: one private doc per signed-in person, so the log follows you across devices.
+let remote = null, writing = false, dirty = false, saveTimer = null;
+function save() {
+  try { localStorage.setItem(KEY, JSON.stringify(data)); } catch {}
+  if (!remote) return;
+  dirty = true; clearTimeout(saveTimer); saveTimer = setTimeout(flush, 600);
+}
+async function flush() {
+  if (!remote || writing || !dirty) return;
+  writing = true; dirty = false;
+  try { await remote.set({ days: data, updatedAt: Date.now() }); }
+  catch { dirty = true; }
+  finally { writing = false; if (dirty) saveTimer = setTimeout(flush, 1500); }
+}
+(async () => {
+  try {
+    const [db, user] = await Promise.all([claude.use('db'), claude.use('user')]);
+    if (!db || !user) return;
+    const ref = db.doc('data/users/' + (await user.id()) + '/log');
+    const snap = await Promise.race([ref.get(), new Promise((_, r) => setTimeout(r, 10000))]);
+    const cloud = (snap.exists && snap.data().days) || {};
+    const hadLocalOnly = Object.keys(data).some(k => !(k in cloud));
+    data = { ...data, ...cloud };
+    remote = ref;
+    try { localStorage.setItem(KEY, JSON.stringify(data)); } catch {}
+    if (hadLocalOnly) { dirty = true; flush(); }
+    render();
+    document.getElementById('syncNote').textContent = 'Synced to your account.';
+  } catch {}
+})();
 
 const pad = n => String(n).padStart(2, '0');
 const keyOf = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -292,12 +322,18 @@ document.getElementById('clearDay').onclick = () => {
   delete data[k]; save(); render(); toast('Cleared');
 };
 
-document.getElementById('exportBtn').onclick = () => {
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+document.getElementById('exportBtn').onclick = async () => {
+  const json = JSON.stringify(data, null, 2), filename = `meal-log-${keyOf(new Date())}.json`;
+  let dl = null;
+  try { dl = typeof claude !== 'undefined' ? await claude.use('downloads') : null; } catch {}
+  if (dl) {
+    try { await dl.save({ filename, data: new Blob([json], { type: 'application/json' }) }); }
+    catch (e) { if (e && e.code !== 'declined') toast("Couldn't save backup"); }
+    return;
+  }
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `meal-log-${keyOf(new Date())}.json`;
-  a.click(); URL.revokeObjectURL(a.href);
+  a.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+  a.download = filename; a.click(); URL.revokeObjectURL(a.href);
 };
 document.getElementById('importBtn').onclick = () => document.getElementById('importFile').click();
 document.getElementById('importFile').onchange = async e => {
